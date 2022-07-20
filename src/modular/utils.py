@@ -26,6 +26,7 @@ from transformers import (
     RobertaConfig,
     RobertaForSequenceClassification,
     RobertaTokenizer,
+    SiameseBertForSequenceClassification,
     XLMConfig,
     XLMForSequenceClassification,
     XLMRobertaConfig,
@@ -45,6 +46,7 @@ import logging
 
 MODEL_CLASSES = {
     "dna": (BertConfig, BertForSequenceClassification, DNATokenizer),
+    "siamese": (BertConfig, SiameseBertForSequenceClassification, DNATokenizer),
     "dnalong": (BertConfig, BertForLongSequenceClassification, DNATokenizer),
     "dnalongcat": (BertConfig, BertForLongSequenceClassificationCat, DNATokenizer),
     "bert": (BertConfig, BertForSequenceClassification, BertTokenizer),
@@ -285,7 +287,9 @@ def get_args() -> argparse.Namespace:
         "--visualize_models", type=int, default=None, help="The model used to do visualization. If None, use 3456.",
     )
     parser.add_argument("--seed", type=int, default=42, help="random seed for initialization")
-    parser.add_argument("--reset-global-step", action="store_true", help="Reset global training step to 0.")
+    
+    parser.add_argument("--reset_global_step", action="store_true", help="Reset global training step to 0.")
+    parser.add_argument("--save_optimizer", action="store_true", help="Set flag to save optimizer state, default not.")
 
 
     parser.add_argument(

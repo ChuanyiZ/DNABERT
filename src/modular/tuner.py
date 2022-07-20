@@ -28,7 +28,10 @@ from transformers import (
 from transformers import glue_compute_metrics as compute_metrics
 from transformers import glue_convert_examples_to_features as convert_examples_to_features
 from transformers import glue_output_modes as output_modes
+output_modes["siamese"] = "classification"
 from transformers import glue_processors as processors
+from transformers.data.processors.glue import DnaPairProcessor
+processors["siamese"] = DnaPairProcessor
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -391,8 +394,8 @@ class Tuner:
                         logs["loss"] = loss_scalar
                         logging_loss = tr_loss
 
-                        for key, value in logs.items():
-                            if args.tensorboard:
+                        if args.tensorboard:
+                            for key, value in logs.items():
                                 tb_writer.add_scalar(key, value, global_step)
                         print(json.dumps({**logs, **{"step": global_step}}))
 
@@ -416,7 +419,8 @@ class Tuner:
 
                         if args.task_name != "dna690":
                             torch.save(args, os.path.join(output_dir, "training_args.bin"))
-                            torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
+                            if args.save_optimizer:
+                                torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
                             torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
                         self.logger.info("Saving optimizer and scheduler states to %s", output_dir)
 
@@ -442,7 +446,7 @@ class Tuner:
         # Loop to handle MNLI double evaluation (matched, mis-matched)
         eval_task_names = ("mnli", "mnli-mm") if args.task_name == "mnli" else (args.task_name,)
         eval_outputs_dirs = (args.output_dir, args.output_dir + "-MM") if args.task_name == "mnli" else (args.output_dir,)
-        if args.task_name[:3] == "dna":
+        if args.task_name[:3] == "dna" or args.task_name == "siamese":
             softmax = torch.nn.Softmax(dim=1)
             
 
@@ -505,6 +509,8 @@ class Tuner:
                         probs = softmax(torch.tensor(preds, dtype=torch.float32)).numpy()
                     else:
                         probs = softmax(torch.tensor(preds, dtype=torch.float32))[:,1].numpy()
+                elif args.task_name == "siamese":
+                    probs = softmax(torch.tensor(preds, dtype=torch.float32))[:,1].numpy()
                 elif args.task_name == "dnasplice":
                     probs = softmax(torch.tensor(preds, dtype=torch.float32)).numpy()
                 preds = np.argmax(preds, axis=1)
@@ -523,7 +529,7 @@ class Tuner:
             output_eval_file = os.path.join(eval_output_dir, prefix, "eval_results.txt")
             with open(output_eval_file, "a") as writer:
 
-                if args.task_name[:3] == "dna":
+                if args.task_name[:3] == "dna" or args.task_name == "siamese":
                     eval_result = args.data_dir.split('/')[-1] + " "
                 else:
                     eval_result = ""
