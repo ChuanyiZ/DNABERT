@@ -163,6 +163,9 @@ if is_torch_available():
         load_tf_weights_in_bert,
         BERT_PRETRAINED_MODEL_ARCHIVE_MAP,
     )
+    from .model_siamese_bert import (
+        SiameseBertForSequenceClassification,
+    )
     from .modeling_openai import (
         OpenAIGPTPreTrainedModel,
         OpenAIGPTModel,
