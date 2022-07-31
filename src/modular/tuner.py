@@ -2,6 +2,7 @@ import logging
 import os
 import datetime
 import json
+import random
 import numpy as np
 from multiprocessing import Pool
 from tqdm import tqdm, trange
@@ -12,7 +13,6 @@ from transformers.tokenization_utils import PreTrainedTokenizer
 from .utils import (
     MODEL_CLASSES,
     TOKEN_ID_GROUP,
-    set_seed,
     _rotate_checkpoints,
 )
 
@@ -48,7 +48,17 @@ class Tuner:
         convert_examples_to_features=convert_examples_to_features
     ) -> None:
         self.option = args
-        self.device = args.device
+
+        # Setup CUDA, GPU & distributed training
+        if args.local_rank == -1 or args.no_cuda:
+            self.device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+            self.n_gpu = torch.cuda.device_count()
+        else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+            torch.cuda.set_device(args.local_rank)
+            self.device = torch.device("cuda", args.local_rank)
+            torch.distributed.init_process_group(backend="nccl")
+            self.n_gpu = 1
+
         self.output_mode = output_mode
         self.config_class = config_class
         self.model_class = model_class
@@ -57,6 +67,13 @@ class Tuner:
         self.convert_examples_to_features = convert_examples_to_features
         self._setup_logger(args)
         self._prepare(args)
+
+    def _set_seed(self, args):
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if self.n_gpu > 0:
+            torch.cuda.manual_seed_all(args.seed)
     
     def _setup_logger(self, args):
         self.logger = logging.getLogger(__name__)
@@ -68,8 +85,8 @@ class Tuner:
         self.logger.warning(
             "Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
             args.local_rank,
-            args.device,
-            args.n_gpu,
+            self.device,
+            self.n_gpu,
             bool(args.local_rank != -1),
             args.fp16,
         )
@@ -115,7 +132,7 @@ class Tuner:
         if args.local_rank == 0:
             torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
-        self.model.to(args.device)
+        self.model.to(self.device)
 
         self.logger.info("Training/evaluation parameters %s", args)
 
@@ -233,7 +250,7 @@ class Tuner:
                 os.makedirs(summary_dir)
             tb_writer = SummaryWriter(summary_dir)
 
-        self.option.train_batch_size = self.option.per_gpu_train_batch_size * max(1, self.option.n_gpu)
+        self.option.train_batch_size = self.option.per_gpu_train_batch_size * max(1, self.n_gpu)
         train_sampler = RandomSampler(train_dataset) if self.option.local_rank == -1 else DistributedSampler(train_dataset)
         train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=self.option.train_batch_size)
 
@@ -269,7 +286,7 @@ class Tuner:
             scheduler.load_state_dict(torch.load(os.path.join(self.option.model_name_or_path, "scheduler.pt")))
 
         # multi-gpu training (should be after apex fp16 initialization)
-        if self.option.n_gpu > 1:
+        if self.n_gpu > 1:
             model = torch.nn.DataParallel(model)
 
         # Distributed training (should be after apex fp16 initialization)
@@ -315,7 +332,7 @@ class Tuner:
         train_iterator = trange(
             epochs_trained, int(self.option.num_train_epochs), desc="Epoch", disable=self.option.local_rank not in [-1, 0],
         )
-        set_seed(self.option)  # Added here for reproductibility
+        self._set_seed(self.option)  # Added here for reproductibility
 
         best_auc = 0
         last_auc = 0
@@ -331,18 +348,18 @@ class Tuner:
                     continue
 
                 self.model.train()
-                batch = tuple(t.to(self.option.device) for t in batch)
+                batch = tuple(t.to(self.device) for t in batch)
                 inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
                 if self.option.model_type != "distilbert":
                     inputs["token_type_ids"] = (
                         batch[2] if self.option.model_type in TOKEN_ID_GROUP else None
                     )  # XLM, DistilBERT, RoBERTa, and XLM-RoBERTa don't use segment_ids
-                if step <= warmup_steps:
-                    inputs["is_freeze"] = True
+                # if step <= warmup_steps:
+                #     inputs["is_freeze"] = True
                 outputs = self.model(**inputs)
                 loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
 
-                if self.option.n_gpu > 1:
+                if self.n_gpu > 1:
                     loss = loss.mean()  # mean() to average on multi-gpu parallel training
                 if self.option.gradient_accumulation_steps > 1:
                     loss = loss / self.option.gradient_accumulation_steps
@@ -408,7 +425,7 @@ class Tuner:
                         if not os.path.exists(output_dir):
                             os.makedirs(output_dir)
                         model_to_save = (
-                            self.model.module if hasattr(model, "module") else self.model
+                            self.model.module if hasattr(self.model, "module") else self.model
                         )  # Take care of distributed/parallel training
                         model_to_save.save_pretrained(output_dir)
                         self.tokenizer.save_pretrained(output_dir)
@@ -455,7 +472,7 @@ class Tuner:
             if not os.path.exists(eval_output_dir) and self.option.local_rank in [-1, 0]:
                 os.makedirs(eval_output_dir)
 
-            self.option.eval_batch_size = self.option.per_gpu_eval_batch_size * max(1, self.option.n_gpu)
+            self.option.eval_batch_size = self.option.per_gpu_eval_batch_size * max(1, self.n_gpu)
             # Note that DistributedSampler samples randomly
             eval_sampler = SequentialSampler(eval_dataset)
             eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=self.option.eval_batch_size)
@@ -475,7 +492,7 @@ class Tuner:
             out_label_ids = None
             for batch in tqdm(eval_dataloader, desc="Evaluating"):
                 self.model.eval()
-                batch = tuple(t.to(self.option.device) for t in batch)
+                batch = tuple(t.to(self.device) for t in batch)
 
                 with torch.no_grad():
                     inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
