@@ -4,7 +4,6 @@ from transformers.model_siamese_bert import SiameseBertForSequenceClassification
 from transformers.tokenization_dna import DNATokenizer
 from .utils import (
     get_args,
-    set_seed,
     convert_example_pairs_to_features,
 )
 from .tuner import Tuner
@@ -12,7 +11,6 @@ from .tuner import Tuner
 def main():
     args = get_args()
     # Set seed
-    set_seed(args)
     finetuner = Tuner(
         args,
         "classification",

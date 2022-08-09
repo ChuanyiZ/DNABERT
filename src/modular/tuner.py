@@ -241,9 +241,20 @@ class Tuner:
 
     def train(
         self,
-        train_dataset
+        train_dataset=None,
+        sampler=None,
+        dataloader=None,
     ):
-        """ Train the model """
+        """Train the model. Only one of the input arguments (train_dataset, sampler, dataloader) can be used.
+
+        Args:
+            train_dataset (optional): Train dataset. Defaults to None.
+            sampler (optional): Custom sampler. Defaults to None.
+            dataloader (optional): Custom dataloader. Defaults to None.
+
+        Returns:
+            global_step, tr_loss / global_step
+        """
         if self.option.local_rank in [-1, 0] and self.option.tensorboard:
             summary_dir = os.path.join(self.option.output_dir, "runs", f"{datetime.datetime.now():%Y-%m-%dT%H-%M-%S}")
             if not os.path.exists(summary_dir):
@@ -251,8 +262,16 @@ class Tuner:
             tb_writer = SummaryWriter(summary_dir)
 
         self.option.train_batch_size = self.option.per_gpu_train_batch_size * max(1, self.n_gpu)
-        train_sampler = RandomSampler(train_dataset) if self.option.local_rank == -1 else DistributedSampler(train_dataset)
-        train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=self.option.train_batch_size)
+        if train_dataset is not None and sampler is None and dataloader is None:
+            train_sampler = RandomSampler(train_dataset) if self.option.local_rank == -1 else DistributedSampler(train_dataset)
+            train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=self.option.train_batch_size)
+        elif train_dataset is None and sampler is not None and dataloader is None:
+            train_data_sampler = sampler(train_dataset)
+            train_dataloader = DataLoader(train_data_sampler, batch_size=self.option.train_batch_size, drop_last=True)
+        elif train_dataset is None and sampler is None and dataloader is not None:
+            train_dataloader = dataloader
+        else:
+            raise ValueError("Only one of the input arguments (train_dataset, sampler, dataloader) can be used.")
 
         if self.option.max_steps > 0:
             t_total = self.option.max_steps
@@ -285,6 +304,13 @@ class Tuner:
             optimizer.load_state_dict(torch.load(os.path.join(self.option.model_name_or_path, "optimizer.pt")))
             scheduler.load_state_dict(torch.load(os.path.join(self.option.model_name_or_path, "scheduler.pt")))
 
+        if self.option.fp16:
+            try:
+                from apex import amp
+            except ImportError:
+                raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+            self.model, optimizer = amp.initialize(self.model, optimizer, opt_level=self.option.fp16_opt_level)
+
         # multi-gpu training (should be after apex fp16 initialization)
         if self.n_gpu > 1:
             model = torch.nn.DataParallel(model)
@@ -297,7 +323,8 @@ class Tuner:
 
         # Train!
         self.logger.info("***** Running training *****")
-        self.logger.info("  Num examples = %d", len(train_dataset))
+        if train_dataset is not None:
+            self.logger.info("  Num examples = %d", len(train_dataset))
         self.logger.info("  Num Epochs = %d", self.option.num_train_epochs)
         self.logger.info("  Instantaneous batch size per GPU = %d", self.option.per_gpu_train_batch_size)
         self.logger.info(
@@ -354,6 +381,8 @@ class Tuner:
                     inputs["token_type_ids"] = (
                         batch[2] if self.option.model_type in TOKEN_ID_GROUP else None
                     )  # XLM, DistilBERT, RoBERTa, and XLM-RoBERTa don't use segment_ids
+                # if step > warmup_steps:
+                #     inputs["use_hard"] = True
                 # if step <= warmup_steps:
                 #     inputs["is_freeze"] = True
                 outputs = self.model(**inputs)
@@ -364,11 +393,18 @@ class Tuner:
                 if self.option.gradient_accumulation_steps > 1:
                     loss = loss / self.option.gradient_accumulation_steps
 
-                loss.backward()
+                if self.option.fp16:
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                else:
+                    loss.backward()
 
                 tr_loss += loss.item()
                 if (step + 1) % self.option.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.option.max_grad_norm)
+                    if self.option.fp16:
+                        torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), self.option.max_grad_norm)
+                    else:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.option.max_grad_norm)
 
                     optimizer.step()
                     scheduler.step()  # Update learning rate schedule
