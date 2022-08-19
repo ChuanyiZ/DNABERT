@@ -265,7 +265,7 @@ class Tuner:
         if train_dataset is not None and sampler is None and dataloader is None:
             train_sampler = RandomSampler(train_dataset) if self.option.local_rank == -1 else DistributedSampler(train_dataset)
             train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=self.option.train_batch_size)
-        elif train_dataset is None and sampler is not None and dataloader is None:
+        elif train_dataset is not None and sampler is not None and dataloader is None:
             train_data_sampler = sampler(train_dataset)
             train_dataloader = DataLoader(train_data_sampler, batch_size=self.option.train_batch_size, drop_last=True)
         elif train_dataset is None and sampler is None and dataloader is not None:
@@ -290,6 +290,20 @@ class Tuner:
         ]
 
         warmup_steps = self.option.warmup_steps if self.option.warmup_percent == 0 else int(self.option.warmup_percent*t_total)
+        freeze_steps = self.option.freeze_steps if self.option.freeze_percent == 0 else int(self.option.freeze_percent*t_total)
+        if self.option.freeze_steps or self.option.freeze_percent:
+            is_freeze = True
+        elif self.option.freeze_layers is not None:
+            is_freeze = self.option.freeze_layers
+        else:
+            is_freeze = False
+        if self.option.semi_hard_percent == 0:
+            if self.option.semi_hard_steps > 0:
+                semi_hard_steps = self.option.semi_hard_steps
+            else:
+                semi_hard_steps = None
+        else:
+            semi_hard_steps = int(self.option.semi_hard_percent*t_total)
 
         optimizer = AdamW(optimizer_grouped_parameters, lr=self.option.learning_rate, eps=self.option.adam_epsilon, betas=(self.option.beta1,self.option.beta2))
         scheduler = get_linear_schedule_with_warmup(
@@ -325,6 +339,8 @@ class Tuner:
         self.logger.info("***** Running training *****")
         if train_dataset is not None:
             self.logger.info("  Num examples = %d", len(train_dataset))
+        elif dataloader is not None:
+            self.logger.info("  Num examples = %d", len(dataloader))
         self.logger.info("  Num Epochs = %d", self.option.num_train_epochs)
         self.logger.info("  Instantaneous batch size per GPU = %d", self.option.per_gpu_train_batch_size)
         self.logger.info(
@@ -376,15 +392,17 @@ class Tuner:
 
                 self.model.train()
                 batch = tuple(t.to(self.device) for t in batch)
-                inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
-                if self.option.model_type != "distilbert":
+                if len(batch) == 4:
+                    inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
                     inputs["token_type_ids"] = (
                         batch[2] if self.option.model_type in TOKEN_ID_GROUP else None
                     )  # XLM, DistilBERT, RoBERTa, and XLM-RoBERTa don't use segment_ids
-                # if step > warmup_steps:
-                #     inputs["use_hard"] = True
-                # if step <= warmup_steps:
-                #     inputs["is_freeze"] = True
+                elif len(batch) == 3:
+                    inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[2]}
+                if semi_hard_steps is not None and step > semi_hard_steps:
+                    inputs["use_hard"] = True
+                if step <= freeze_steps:
+                    inputs["is_freeze"] = is_freeze
                 outputs = self.model(**inputs)
                 loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
 
