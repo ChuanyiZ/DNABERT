@@ -65,6 +65,7 @@ class Tuner:
         self.tokenizer_class = tokenizer_class
         self.processor = processor_class()
         self.convert_examples_to_features = convert_examples_to_features
+        self._set_seed(self.option)  # Added here for reproductibility
         self._setup_logger(args)
         self._prepare(args)
 
@@ -375,7 +376,6 @@ class Tuner:
         train_iterator = trange(
             epochs_trained, int(self.option.num_train_epochs), desc="Epoch", disable=self.option.local_rank not in [-1, 0],
         )
-        self._set_seed(self.option)  # Added here for reproductibility
 
         best_auc = 0
         last_auc = 0
